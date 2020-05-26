@@ -5,7 +5,7 @@
 
 import time
 import ssl
-from os import environ
+from os import environ, path
 from ansible.module_utils.six import string_types
 from ansible.module_utils.basic import AnsibleModule
 
@@ -31,6 +31,7 @@ class OpenNebulaModule:
         api_url=dict(type='str', aliases=['api_endpoint'], default=environ.get("ONE_URL")),
         api_username=dict(type='str', default=environ.get("ONE_USERNAME")),
         api_password=dict(type='str', no_log=True, aliases=['api_token'], default=environ.get("ONE_PASSWORD")),
+        api_auth_file=dict(type='str', default=environ.get("ONE_AUTH")),
         validate_certs=dict(default=True, type='bool'),
         wait_timeout=dict(type='int', default=300),
     )
@@ -71,17 +72,32 @@ class OpenNebulaModule:
         if self.module.params.get("api_url"):
             url = self.module.params.get("api_url")
         else:
-            self.fail("Either api_url or the environment variable ONE_URL must be provided")
+            import socket
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            url = 'http://localhost:2633/RPC2'
+            try:
+                self.module.warn("api_url or the environment variable ONE_URL was not provided, trying default '%s'" % url)
+                s.connect(('localhost', 2633))
+                s.shutdown(2)
+            except ConnectionError:
+                self.fail(msg=("api_url or the environment variable ONE_URL was not provided, default '%s' also unavailable" % url))
 
-        if self.module.params.get("api_username"):
+        if self.module.params.get("api_username") and self.module.params.get("api_password"):
             username = self.module.params.get("api_username")
-        else:
-            self.fail("Either api_username or the environment vairable ONE_USERNAME must be provided")
-
-        if self.module.params.get("api_password"):
             password = self.module.params.get("api_password")
         else:
-            self.fail("Either api_password or the environment vairable ONE_PASSWORD must be provided")
+            if self.module.params.get("api_auth_file"):
+                authfile = self.module.params.get("api_auth_file")
+            else:
+                authfile = path.join(environ.get("HOME"), ".one", "one_auth")
+            try:
+                authstring = open(authfile, "r").read().rstrip()
+                username = authstring.split(":")[0]
+                password = authstring.split(":")[1]
+            except (OSError, IOError):
+                self.fail(msg=("No Credentials provided and could not find or read ONE_AUTH file at '%s'" % authfile))
+            except Exception:
+                self.fail(msg=("Error occurs when read ONE_AUTH file at '%s'" % authfile))
 
         session = "%s:%s" % (username, password)
 
@@ -183,20 +199,72 @@ class OpenNebulaModule:
                 return c
         return None
 
-    def get_template_by_name(self, name):
-        '''
-        Returns a template given its name.
-        Args:
-            name: the name of the template
+    def get_template(self, predicate):
+        pool = self.one.templatepool.info(-2, -1, -1, -1)
+        # Filter -2 means fetch all templates user can Use
+        found = 0
+        found_template = None
+        template_name = ''
 
-        Returns: the template object or None if the host is absent.
+        for template in pool.VMTEMPLATE:
+            if predicate(template):
+                found = found + 1
+                found_template = template
+                template_name = template.NAME
 
-        '''
-        templates = self.one.templatepool.info()
-        for t in templates.TEMPLATE:
-            if t.NAME == name:
-                return t
-        return None
+        if found == 0:
+            return None
+        elif found > 1:
+            self.module.fail_json(msg='There are more templates with name: ' + template_name)
+        return found_template
+
+    def get_template_by_name(self, template_name):
+        return self.get_template(lambda template: (template.NAME == template_name))
+
+
+    def get_template_by_id(self, template_id):
+        return self.get_template(lambda template: (template.ID == template_id))
+
+
+    def get_template_id(self, requested_id, requested_name):
+        template = self.get_template_by_id(requested_id) if requested_id is not None else self.get_template_by_name(requested_name)
+        if template:
+            return template.ID
+        else:
+            return None
+
+    def get_datastore(self, predicate):
+        pool = self.one.datastorepool.info()
+        found = 0
+        found_datastore = None
+        datastore_name = ''
+
+        for datastore in pool.DATASTORE:
+            if predicate(datastore):
+                found = found + 1
+                found_datastore = datastore
+                datastore_name = datastore.NAME
+
+        if found == 0:
+            return None
+        elif found > 1:
+            self.module.fail_json(msg='There are more datastores with name: ' + datastore_name)
+        return found_datastore
+
+    def get_datastore_by_name(self, datastore_name):
+        return self.get_datastore(lambda datastore: (datastore.NAME == datastore_name))
+
+
+    def get_datastore_by_id(self, datastore_id):
+        return self.get_datastore(lambda datastore: (datastore.ID == datastore_id))
+
+
+    def get_datastore_id(self, requested_id, requested_name):
+        datastore = self.get_datastore_by_id(requested_id) if requested_id else self.get_datastore_by_name(requested_name)
+        if datastore:
+            return datastore.ID
+        else:
+            return None
 
     def cast_template(self, template):
         """
@@ -283,6 +351,148 @@ class OpenNebulaModule:
             time.sleep(self.one.server_retry_interval())
 
         self.fail(msg="Wait timeout has expired!")
+
+    def get_all_vms(self):
+        pool = self.one.vmpool.info(-2, -1, -1, -1)
+        # Filter -2 means fetch all vms user has
+
+        return pool
+
+    def parse_vm_permissions(self, vm):
+        vm_PERMISSIONS = self.one.vm.info(vm.ID).PERMISSIONS
+
+        owner_octal = int(vm_PERMISSIONS.OWNER_U) * 4 + int(vm_PERMISSIONS.OWNER_M) * 2 + int(vm_PERMISSIONS.OWNER_A)
+        group_octal = int(vm_PERMISSIONS.GROUP_U) * 4 + int(vm_PERMISSIONS.GROUP_M) * 2 + int(vm_PERMISSIONS.GROUP_A)
+        other_octal = int(vm_PERMISSIONS.OTHER_U) * 4 + int(vm_PERMISSIONS.OTHER_M) * 2 + int(vm_PERMISSIONS.OTHER_A)
+
+        permissions = str(owner_octal) + str(group_octal) + str(other_octal)
+
+        return permissions
+
+    def set_vm_permissions(self, vms, permissions):
+        changed = False
+
+        for vm in vms:
+            vm = self.one.vm.info(vm.ID)
+            old_permissions = self.parse_vm_permissions(vm)
+            changed = changed or old_permissions != permissions
+
+            if not module.check_mode and old_permissions != permissions:
+                permissions_str = bin(int(permissions, base=8))[2:]  # 600 -> 110000000
+                mode_bits = [int(d) for d in permissions_str]
+                try:
+                    self.one.vm.chmod(
+                        vm.ID, mode_bits[0], mode_bits[1], mode_bits[2], mode_bits[3], mode_bits[4], mode_bits[5], mode_bits[6], mode_bits[7], mode_bits[8])
+                except pyone.OneAuthorizationException:
+                    self.module.fail_json(msg="Permissions changing is unsuccessful, but instances are present if you deployed them.")
+
+        return changed
+
+    def set_vm_ownership(self, vms, owner_id, group_id):
+        changed = False
+
+        for vm in vms:
+            vm = self.one.vm.info(vm.ID)
+            if owner_id is None:
+                owner_id = vm.UID
+            if group_id is None:
+                group_id = vm.GID
+
+            changed = changed or owner_id != vm.UID or group_id != vm.GID
+
+            if not self.module.check_mode and (owner_id != vm.UID or group_id != vm.GID):
+                try:
+                    self.one.vm.chown(vm.ID, owner_id, group_id)
+                except pyone.OneAuthorizationException:
+                    self.module.fail_json(msg="Ownership changing is unsuccessful, but instances are present if you deployed them.")
+
+        return changed
+
+    def get_all_users(self):
+        pool = self.one.userpool.info()
+        return pool
+
+    def get_user_by_name(self, name):
+        pool = self.get_all_users()
+        for user in pool.USER:
+            if name == user.NAME:
+                return user.ID
+        self.fail(msg="There is no User with name=" + name)
+
+    def get_all_groups(self):
+        pool = self.one.grouppool.info()
+        return pool
+
+    def get_group_by_name(self, name):
+        pool = self.get_all_groups()
+        for group in pool.GROUP:
+            if name == group.NAME:
+                return group.ID
+        self.fail(msg="There is no Group with name=" + name)
+
+    def get_vm_labels_and_attributes_dict(self, vm_id):
+        vm_USER_TEMPLATE = self.one.vm.info(vm_id).USER_TEMPLATE
+
+        attrs_dict = {}
+        labels_list = []
+
+        for key, value in vm_USER_TEMPLATE.items():
+            if key != 'LABELS':
+                attrs_dict[key] = value
+            else:
+                if key is not None:
+                    labels_list = value.split(',')
+
+        return labels_list, attrs_dict
+
+    def get_vm_by_id(self, vm_id):
+        try:
+            vm = self.one.vm.info(int(vm_id))
+        except BaseException:
+            return None
+        return vm
+
+    def get_vms_by_ids(self, ids, state=None):
+        vms = []
+        pool = self.get_all_vms()
+
+        for vm in pool.VM:
+            if vm.ID in ids:
+                vms.append(vm)
+                ids.remove(vm.ID)
+                if len(ids) == 0:
+                    break
+
+        if len(ids) > 0 and state != 'absent':
+            self.fail(msg='There is no VM(s) with id(s)=' + ', '.join('{id}'.format(id=str(vm_id)) for vm_id in ids))
+
+        return vms
+
+    def get_vms_by_name(self, name_pattern):
+        vms = []
+        pattern = None
+
+        pool = self.get_all_vms()
+
+        if name_pattern.startswith('~'):
+            import re
+            if name_pattern[1] == '*':
+                pattern = re.compile(name_pattern[2:], re.IGNORECASE)
+            else:
+                pattern = re.compile(name_pattern[1:])
+
+        for vm in pool.VM:
+            if pattern is not None:
+                if pattern.match(vm.NAME):
+                    vms.append(vm)
+            elif name_pattern == vm.NAME:
+                vms.append(vm)
+                break
+
+        if pattern is None and len(vms) == 0:
+            self.fail(msg="There is no VM with name=" + name_pattern)
+
+        return vms
 
     def run_module(self):
         """
